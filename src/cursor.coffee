@@ -1,7 +1,6 @@
 {Point, Range} = require 'text-buffer'
 {Emitter} = require 'event-kit'
 _ = require 'underscore-plus'
-Grim = require 'grim'
 Model = require './model'
 
 # Extended: The `Cursor` class represents the little blinking line identifying
@@ -17,37 +16,11 @@ class Cursor extends Model
   visible: true
 
   # Instantiated by a {TextEditor}
-  constructor: ({@editor, @marker, id}) ->
+  constructor: ({@editor, @marker, @config, id}) ->
     @emitter = new Emitter
 
     @assignId(id)
     @updateVisibility()
-    @marker.onDidChange (e) =>
-      @updateVisibility()
-      {oldHeadScreenPosition, newHeadScreenPosition} = e
-      {oldHeadBufferPosition, newHeadBufferPosition} = e
-      {textChanged} = e
-      return if oldHeadScreenPosition.isEqual(newHeadScreenPosition)
-
-      @goalColumn = null
-
-      movedEvent =
-        oldBufferPosition: oldHeadBufferPosition
-        oldScreenPosition: oldHeadScreenPosition
-        newBufferPosition: newHeadBufferPosition
-        newScreenPosition: newHeadScreenPosition
-        textChanged: textChanged
-        cursor: this
-
-      @emit 'moved', movedEvent if Grim.includeDeprecatedAPIs
-      @emitter.emit 'did-change-position', movedEvent
-      @editor.cursorMoved(movedEvent)
-    @marker.onDidDestroy =>
-      @destroyed = true
-      @editor.removeCursor(this)
-      @emit 'destroyed' if Grim.includeDeprecatedAPIs
-      @emitter.emit 'did-destroy'
-      @emitter.dispose()
 
   destroy: ->
     @marker.destroy()
@@ -88,18 +61,6 @@ class Cursor extends Model
   onDidChangeVisibility: (callback) ->
     @emitter.on 'did-change-visibility', callback
 
-  on: (eventName) ->
-    return unless Grim.includeDeprecatedAPIs
-
-    switch eventName
-      when 'moved'
-        Grim.deprecate("Use Cursor::onDidChangePosition instead")
-      when 'destroyed'
-        Grim.deprecate("Use Cursor::onDidDestroy instead")
-      else
-        Grim.deprecate("::on is no longer supported. Use the event subscription methods instead")
-    super
-
   ###
   Section: Managing Cursor Position
   ###
@@ -114,7 +75,7 @@ class Cursor extends Model
     @changePosition options, =>
       @marker.setHeadScreenPosition(screenPosition, options)
 
-  # Public: Returns the screen position of the cursor as an Array.
+  # Public: Returns the screen position of the cursor as a {Point}.
   getScreenPosition: ->
     @marker.getHeadScreenPosition()
 
@@ -197,7 +158,7 @@ class Cursor extends Model
     [before, after] = @editor.getTextInBufferRange(range)
     return false if /\s/.test(before) or /\s/.test(after)
 
-    nonWordCharacters = atom.config.get('editor.nonWordCharacters', scope: @getScopeDescriptor()).split('')
+    nonWordCharacters = @config.get('editor.nonWordCharacters', scope: @getScopeDescriptor()).split('')
     _.contains(nonWordCharacters, before) isnt _.contains(nonWordCharacters, after)
 
   # Public: Returns whether this cursor is between a word's start and end.
@@ -399,6 +360,18 @@ class Cursor extends Model
     if position = @getNextWordBoundaryBufferPosition()
       @setBufferPosition(position)
 
+  # Public: Moves the cursor to the previous subword boundary.
+  moveToPreviousSubwordBoundary: ->
+    options = {wordRegex: @subwordRegExp(backwards: true)}
+    if position = @getPreviousWordBoundaryBufferPosition(options)
+      @setBufferPosition(position)
+
+  # Public: Moves the cursor to the next subword boundary.
+  moveToNextSubwordBoundary: ->
+    options = {wordRegex: @subwordRegExp()}
+    if position = @getNextWordBoundaryBufferPosition(options)
+      @setBufferPosition(position)
+
   # Public: Moves the cursor to the beginning of the buffer line, skipping all
   # whitespace.
   skipLeadingWhitespace: ->
@@ -433,7 +406,7 @@ class Cursor extends Model
   getPreviousWordBoundaryBufferPosition: (options = {}) ->
     currentBufferPosition = @getBufferPosition()
     previousNonBlankRow = @editor.buffer.previousNonBlankRow(currentBufferPosition.row)
-    scanRange = [[previousNonBlankRow, 0], currentBufferPosition]
+    scanRange = [[previousNonBlankRow ? 0, 0], currentBufferPosition]
 
     beginningOfWordPosition = null
     @editor.backwardsScanInBufferRange (options.wordRegex ? @wordRegExp()), scanRange, ({range, stop}) ->
@@ -524,9 +497,13 @@ class Cursor extends Model
 
     endOfWordPosition = null
     @editor.scanInBufferRange (options.wordRegex ? @wordRegExp(options)), scanRange, ({range, stop}) ->
-      if range.start.isLessThanOrEqual(currentBufferPosition) or allowNext
-        endOfWordPosition = range.end
-      if not endOfWordPosition?.isEqual(currentBufferPosition)
+      if allowNext
+        if range.end.isGreaterThan(currentBufferPosition)
+          endOfWordPosition = range.end
+          stop()
+      else
+        if range.start.isLessThanOrEqual(currentBufferPosition)
+          endOfWordPosition = range.end
         stop()
 
     endOfWordPosition ? currentBufferPosition
@@ -588,7 +565,6 @@ class Cursor extends Model
   setVisible: (visible) ->
     if @visible isnt visible
       @visible = visible
-      @emit 'visibility-changed', @visible if Grim.includeDeprecatedAPIs
       @emitter.emit 'did-change-visibility', @visible
 
   # Public: Returns the visibility of the cursor.
@@ -629,11 +605,38 @@ class Cursor extends Model
   # Returns a {RegExp}.
   wordRegExp: ({includeNonWordCharacters}={}) ->
     includeNonWordCharacters ?= true
-    nonWordCharacters = atom.config.get('editor.nonWordCharacters', scope: @getScopeDescriptor())
+    nonWordCharacters = @config.get('editor.nonWordCharacters', scope: @getScopeDescriptor())
     segments = ["^[\t ]*$"]
     segments.push("[^\\s#{_.escapeRegExp(nonWordCharacters)}]+")
     if includeNonWordCharacters
       segments.push("[#{_.escapeRegExp(nonWordCharacters)}]+")
+    new RegExp(segments.join("|"), "g")
+
+  # Public: Get the RegExp used by the cursor to determine what a "subword" is.
+  #
+  # * `options` (optional) {Object} with the following keys:
+  #   * `backwards` A {Boolean} indicating whether to look forwards or backwards
+  #     for the next subword. (default: false)
+  #
+  # Returns a {RegExp}.
+  subwordRegExp: (options={}) ->
+    nonWordCharacters = @config.get('editor.nonWordCharacters', scope: @getScopeDescriptor())
+    lowercaseLetters = 'a-z\\u00DF-\\u00F6\\u00F8-\\u00FF'
+    uppercaseLetters = 'A-Z\\u00C0-\\u00D6\\u00D8-\\u00DE'
+    snakeCamelSegment = "[#{uppercaseLetters}]?[#{lowercaseLetters}]+"
+    segments = [
+      "^[\t ]+",
+      "[\t ]+$",
+      "[#{uppercaseLetters}]+(?![#{lowercaseLetters}])",
+      "\\d+"
+    ]
+    if options.backwards
+      segments.push("#{snakeCamelSegment}_*")
+      segments.push("[#{_.escapeRegExp(nonWordCharacters)}]+\\s*")
+    else
+      segments.push("_*#{snakeCamelSegment}")
+      segments.push("\\s*[#{_.escapeRegExp(nonWordCharacters)}]+")
+    segments.push("_+")
     new RegExp(segments.join("|"), "g")
 
   ###
@@ -681,12 +684,3 @@ class Cursor extends Model
         position = range.start
         stop()
     position
-
-if Grim.includeDeprecatedAPIs
-  Cursor::getScopes = ->
-    Grim.deprecate 'Use Cursor::getScopeDescriptor() instead'
-    @getScopeDescriptor().getScopesArray()
-
-  Cursor::getMoveNextWordBoundaryBufferPosition = (options) ->
-    Grim.deprecate 'Use `::getNextWordBoundaryBufferPosition(options)` instead'
-    @getNextWordBoundaryBufferPosition(options)

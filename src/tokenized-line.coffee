@@ -184,7 +184,7 @@ class TokenizedLine
       @lineIsWhitespaceOnly = true
       @firstTrailingWhitespaceIndex = 0
 
-  getTokenIterator: -> @tokenIterator.reset(this)
+  getTokenIterator: -> @tokenIterator.reset(this, arguments...)
 
   Object.defineProperty @prototype, 'tokens', get: ->
     iterator = @getTokenIterator()
@@ -387,15 +387,17 @@ class TokenizedLine
             rightSpecialTokens[rightTags.length] = specialToken
           rightTags.push(tag)
 
-      # tag represents the start or end of a scop
+      # tag represents the start of a scope
       else if (tag % 2) is -1
         if screenColumn < column
           leftTags.push(tag)
           rightOpenScopes.push(tag)
         else
           rightTags.push(tag)
+
+      # tag represents the end of a scope
       else
-        if screenColumn < column
+        if screenColumn <= column
           leftTags.push(tag)
           rightOpenScopes.pop()
         else
